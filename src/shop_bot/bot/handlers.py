@@ -72,7 +72,7 @@ from shop_bot.config import (
     get_purchase_success_text
 )
 from shop_bot.data_manager import remnawave_repository as rw_repo
-from shop_bot.modules import remnawave_api
+from shop_bot.modules import remnawave_api, happ_crypto
 
 TELEGRAM_BOT_USERNAME = None
 PAYMENT_METHODS = None
@@ -1870,6 +1870,33 @@ def get_user_router() -> Router:
             await callback.message.answer_photo(photo=qr_code_file)
         except Exception as e:
             logger.error(f"Error showing QR for key {key_id}: {e}")
+
+    @user_router.callback_query(F.data.startswith("get_happ_crypto_link_"))
+    @registration_required
+    async def get_happ_crypto_link_handler(callback: types.CallbackQuery):
+        await callback.answer("Генерирую Happ CryptoLink...")
+        key_id = int(callback.data.split("_")[4])
+        key_data = rw_repo.get_key_by_id(key_id)
+        if not key_data or key_data['user_id'] != callback.from_user.id:
+            await callback.answer("Ошибка: Не удалось найти ключ.", show_alert=True)
+            return
+
+        try:
+            details = await remnawave_api.get_key_details_from_host(key_data)
+            if not details or not details['connection_string']:
+                await callback.answer("Ошибка: Не удалось получить данные ключа.", show_alert=True)
+                return
+
+            connection_string = details['connection_string']
+            encrypted_link = happ_crypto.encrypt_link_with_api(connection_string)
+
+            if encrypted_link:
+                await callback.message.answer(f"Ваш Happ CryptoLink:\n<code>{encrypted_link}</code>")
+            else:
+                await callback.answer("Ошибка: Не удалось сгенерировать CryptoLink.", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error creating Happ CryptoLink for key {key_id}: {e}")
+            await callback.answer("Произошла ошибка при создании ссылки.", show_alert=True)
 
     @user_router.callback_query(F.data.startswith("howto_vless_"))
     @registration_required

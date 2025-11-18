@@ -129,7 +129,7 @@
 2) Выполните:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/tweopi/remnawave-shopbot/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/ASTRACAT2022/subBot-/main/install.sh | bash
 ```
 
 3) Следуйте инструкциям установщика:

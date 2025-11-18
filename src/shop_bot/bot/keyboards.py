@@ -513,6 +513,7 @@ def create_key_info_keyboard(key_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Продлить этот ключ", callback_data=f"extend_key_{key_id}")
     builder.button(text="📱 Показать QR-код", callback_data=f"show_qr_{key_id}")
+    builder.button(text="🔗 Получить Happ CryptoLink", callback_data=f"get_happ_crypto_link_{key_id}")
     builder.button(text="📖 Инструкция", callback_data=f"howto_vless_{key_id}")
     builder.button(text="⬅️ Назад к списку ключей", callback_data="manage_keys")
     builder.adjust(1)

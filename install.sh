@@ -350,7 +350,7 @@ log_info "\nШаг 5: сборка и запуск Docker-контейнеров
 if [[ -n "$(sudo docker-compose ps -q 2>/dev/null)" ]]; then
     sudo docker-compose down
 fi
-sudo docker-compose up -d --build
+sudo docker compose up -d --build
 
 cat <<SUMMARY
 

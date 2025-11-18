@@ -244,8 +244,8 @@ EOF
     log_success "✔ Конфигурация Nginx обновлена."
 }
 
-REPO_URL="https://github.com/tweopi/remnawave-shopbot.git"
-PROJECT_DIR="remnawave-shopbot"
+REPO_URL="https://github.com/ASTRACAT2022/subBot-.git"
+PROJECT_DIR="subBot-"
 NGINX_CONF="/etc/nginx/sites-available/${PROJECT_DIR}.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/${PROJECT_DIR}.conf"
 

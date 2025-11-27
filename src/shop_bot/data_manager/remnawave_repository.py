@@ -1,6 +1,6 @@
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from shop_bot.data_manager import database
@@ -22,7 +22,7 @@ def _normalize_email(value: str | None) -> str:
 
 
 def _default_expire_at_ms() -> int:
-    return int(datetime.utcnow().timestamp() * 1000)
+    return int((datetime.utcnow() + timedelta(days=30)).timestamp() * 1000)
 
 
 def list_squads(active_only: bool = False) -> list[dict[str, Any]]:

@@ -222,6 +222,7 @@ _LEGACY_FORWARDERS = (
     "ban_user",
     "create_gift_key",
     "create_host",
+    "create_host_full",
     "create_pending_transaction",
     "create_payload_pending",
     "create_plan",
@@ -303,6 +304,8 @@ _LEGACY_FORWARDERS = (
     "update_ticket_subject",
     "update_ticket_thread_info",
     "update_user_stats",
+    "update_host_country",
+    "update_host_server_public_key",
 
     "get_all_ssh_targets",
     "get_ssh_target",
@@ -713,3 +716,17 @@ def redeem_promo_code(code: str, user_id: int, *, applied_amount: float, order_i
             if str(e).startswith("FOREIGN KEY constraint failed"):
                 return None
             raise
+
+
+def create_host_full(
+    name: str,
+    ip: str,
+    country: str,
+    api_url: str,
+    api_token: str,
+    server_public_key: str,
+    wireguard_port: int,
+):
+    return database.create_host_full(
+        name, ip, country, api_url, api_token, server_public_key, wireguard_port
+    )

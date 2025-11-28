@@ -444,6 +444,9 @@ def _ensure_hosts_columns(cursor: sqlite3.Cursor) -> None:
         "ssh_user": "TEXT",
         "ssh_password": "TEXT",
         "ssh_key_path": "TEXT",
+        "country": "TEXT",
+        "server_public_key": "TEXT",
+        "wireguard_port": "INTEGER",
 
         "remnawave_base_url": "TEXT",
         "remnawave_api_token": "TEXT",
@@ -752,6 +755,33 @@ def get_metrics_series(scope: str, object_name: str, *, since_hours: int = 24, l
         return []
 
 
+def create_host_full(
+    name: str,
+    ip: str,
+    country: str,
+    api_url: str,
+    api_token: str,
+    server_public_key: str,
+    wireguard_port: int,
+):
+    try:
+        name = normalize_host_name(name)
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO xui_hosts
+                (host_name, ssh_host, country, remnawave_base_url, remnawave_api_token, server_public_key, wireguard_port, host_url, host_username, host_pass, host_inbound_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (name, ip, country, api_url, api_token, server_public_key, wireguard_port, api_url, "", "", 0)
+            )
+            conn.commit()
+            logging.info(f"Успешно создан новый хост: {name}")
+    except sqlite3.Error as e:
+        logging.error(f"Ошибка при создании хоста '{name}': {e}")
+
+
 def create_host(name: str, url: str, user: str, passwd: str, inbound: int, subscription_url: str | None = None):
     try:
         name = normalize_host_name(name)
@@ -837,6 +867,52 @@ def update_host_url(host_name: str, new_url: str) -> bool:
             return cursor.rowcount > 0
     except sqlite3.Error as e:
         logging.error(f"Не удалось обновить host_url для хоста '{host_name}': {e}")
+        return False
+
+
+def update_host_country(host_name: str, country: str) -> bool:
+    """Обновить страну для указанного хоста."""
+    try:
+        host_name = normalize_host_name(host_name)
+        country = (country or "").strip()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM xui_hosts WHERE TRIM(host_name) = TRIM(?)", (host_name,))
+            if cursor.fetchone() is None:
+                logging.warning(f"update_host_country: хост с именем '{host_name}' не найден")
+                return False
+
+            cursor.execute(
+                "UPDATE xui_hosts SET country = ? WHERE TRIM(host_name) = TRIM(?)",
+                (country, host_name)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось обновить country для хоста '{host_name}': {e}")
+        return False
+
+
+def update_host_server_public_key(host_name: str, server_public_key: str) -> bool:
+    """Обновить публичный ключ сервера для указанного хоста."""
+    try:
+        host_name = normalize_host_name(host_name)
+        server_public_key = (server_public_key or "").strip()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM xui_hosts WHERE TRIM(host_name) = TRIM(?)", (host_name,))
+            if cursor.fetchone() is None:
+                logging.warning(f"update_host_server_public_key: хост с именем '{host_name}' не найден")
+                return False
+
+            cursor.execute(
+                "UPDATE xui_hosts SET server_public_key = ? WHERE TRIM(host_name) = TRIM(?)",
+                (server_public_key, host_name)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось обновить server_public_key для хоста '{host_name}': {e}")
         return False
 
 def update_host_remnawave_settings(

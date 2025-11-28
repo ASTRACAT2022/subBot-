@@ -40,6 +40,10 @@ from shop_bot.data_manager.remnawave_repository import (
     create_promo_code,
     list_promo_codes,
     update_promo_code_status,
+    delete_host,
+)
+from shop_bot.data_manager.remnawave_repository import (
+    create_host_full,
 )
 from shop_bot.data_manager.database import (
     update_key_email,
@@ -58,6 +62,16 @@ class Broadcast(StatesGroup):
     waiting_for_button_text = State()
     waiting_for_button_url = State()
     waiting_for_confirmation = State()
+
+
+class AdminNode(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_ip = State()
+    waiting_for_country = State()
+    waiting_for_api_url = State()
+    waiting_for_api_token = State()
+    waiting_for_server_public_key = State()
+    waiting_for_wireguard_port = State()
 
 
 def get_admin_router() -> Router:
@@ -3503,6 +3517,165 @@ def get_admin_router() -> Router:
         kb.adjust(2)
         
         await callback.message.edit_text("\n".join(txt), parse_mode='HTML', reply_markup=kb.as_markup())
+
+    @admin_router.callback_query(F.data == "admin_nodes_menu")
+    async def admin_nodes_menu_handler(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await callback.message.edit_text(
+            "⚙️ Управление нодами",
+            reply_markup=keyboards.create_admin_nodes_menu_keyboard()
+        )
+
+    @admin_router.callback_query(F.data == "admin_list_nodes")
+    async def admin_list_nodes_handler(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        nodes = get_all_hosts()
+        await callback.message.edit_text(
+            "📋 Список нод:",
+            reply_markup=keyboards.create_admin_nodes_list_keyboard(nodes)
+        )
+
+    @admin_router.callback_query(F.data == "admin_add_node")
+    async def admin_add_node_start(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        await state.set_state(AdminNode.waiting_for_name)
+        await callback.message.edit_text(
+            "Введите название ноды (например, 'Germany'):",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_name)
+    async def admin_add_node_name(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        await state.update_data(node_name=message.text)
+        await state.set_state(AdminNode.waiting_for_ip)
+        await message.answer(
+            "Введите IP-адрес ноды:",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_ip)
+    async def admin_add_node_ip(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        await state.update_data(node_ip=message.text)
+        await state.set_state(AdminNode.waiting_for_country)
+        await message.answer(
+            "Введите страну ноды (например, 'de'):",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_country)
+    async def admin_add_node_country(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        await state.update_data(country=message.text)
+        await state.set_state(AdminNode.waiting_for_api_url)
+        await message.answer(
+            "Введите URL API ноды (например, 'http://IP:PORT'):",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_api_url)
+    async def admin_add_node_api_url(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        await state.update_data(api_url=message.text)
+        await state.set_state(AdminNode.waiting_for_api_token)
+        await message.answer(
+            "Введите токен API ноды:",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_api_token)
+    async def admin_add_node_api_token(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        await state.update_data(api_token=message.text)
+        await state.set_state(AdminNode.waiting_for_server_public_key)
+        await message.answer(
+            "Введите публичный ключ сервера:",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_server_public_key)
+    async def admin_add_node_server_public_key(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        await state.update_data(server_public_key=message.text)
+        await state.set_state(AdminNode.waiting_for_wireguard_port)
+        await message.answer(
+            "Введите порт WireGuard (например, 51820):",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminNode.waiting_for_wireguard_port)
+    async def admin_add_node_wireguard_port(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        data = await state.get_data()
+        node_name = data.get("node_name")
+        node_ip = data.get("node_ip")
+        country = data.get("country")
+        api_url = data.get("api_url")
+        api_token = data.get("api_token")
+        server_public_key = data.get("server_public_key")
+        wireguard_port = message.text
+
+        create_host_full(
+            name=node_name,
+            ip=node_ip,
+            country=country,
+            api_url=api_url,
+            api_token=api_token,
+            server_public_key=server_public_key,
+            wireguard_port=int(wireguard_port),
+        )
+
+        await state.clear()
+        await message.answer(f"✅ Нода '{node_name}' добавлена.")
+        nodes = get_all_hosts()
+        await message.answer(
+            "📋 Список нод:",
+            reply_markup=keyboards.create_admin_nodes_list_keyboard(nodes)
+        )
+
+    @admin_router.callback_query(F.data.startswith("admin_delete_node_prompt_"))
+    async def admin_delete_node_prompt(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        node_name = callback.data.split("admin_delete_node_prompt_")[-1]
+        await callback.answer()
+        await callback.message.edit_text(
+            f"Вы уверены, что хотите удалить ноду '{node_name}'?",
+            reply_markup=keyboards.create_admin_delete_node_confirm_keyboard(node_name)
+        )
+
+    @admin_router.callback_query(F.data.startswith("admin_delete_node_confirm_"))
+    async def admin_delete_node_confirm(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        node_name = callback.data.split("admin_delete_node_confirm_")[-1]
+        delete_host(node_name)
+        await callback.answer("🗑 Нода удалена.")
+        nodes = get_all_hosts()
+        await callback.message.edit_text(
+            "📋 Список нод:",
+            reply_markup=keyboards.create_admin_nodes_list_keyboard(nodes)
+        )
 
     return admin_router
 

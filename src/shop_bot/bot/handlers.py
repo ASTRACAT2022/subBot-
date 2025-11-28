@@ -61,6 +61,8 @@ from shop_bot.data_manager.remnawave_repository import (
     log_transaction,
     is_admin,
 )
+from shop_bot.modules.awg_config_generator import generate_awg_config
+from aiogram.types import BufferedInputFile
 
 from shop_bot.config import (
     get_profile_text,
@@ -376,6 +378,11 @@ class SupportDialog(StatesGroup):
     waiting_for_subject = State()
     waiting_for_message = State()
     waiting_for_reply = State()
+
+
+class ConfigGeneration(StatesGroup):
+    waiting_for_country = State()
+
 
 def is_valid_email(email: str) -> bool:
     pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
@@ -3318,3 +3325,115 @@ async def process_successful_payment(bot: Bot, metadata: dict):
                 pass
 
 
+    def create_country_selection_keyboard(hosts: list) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        for host in hosts:
+            country = host.get('country')
+            if country:
+                builder.button(text=country, callback_data=f"select_country_{host['host_name']}")
+        builder.button(text="⬅️ Назад", callback_data="manage_keys")
+        builder.adjust(1)
+        return builder.as_markup()
+
+
+    @user_router.callback_query(F.data == "generate_config")
+    @registration_required
+    async def generate_config_start(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer()
+        user_id = callback.from_user.id
+        user_keys = get_user_keys(user_id)
+        active_keys = [key for key in user_keys if datetime.fromisoformat(key['expiry_date']) > datetime.now()]
+
+        if not active_keys:
+            await callback.message.edit_text("❌ У вас нет активных ключей для генерации конфигурации.")
+            return
+
+        hosts = get_all_hosts()
+        if not hosts:
+            await callback.message.edit_text("❌ В данный момент нет доступных серверов для генерации конфигурации.")
+            return
+
+        await callback.message.edit_text(
+            "Выберите страну для генерации конфигурации:",
+            reply_markup=create_country_selection_keyboard(hosts)
+        )
+        await state.set_state(ConfigGeneration.waiting_for_country)
+
+
+    @user_router.callback_query(ConfigGeneration.waiting_for_country, F.data.startswith("select_country_"))
+    async def process_country_selection(callback: types.CallbackQuery, state: FSMContext):
+        from wireguard_tools import WireguardKey
+        await callback.answer("Генерирую конфигурацию...")
+        host_name = callback.data.split("select_country_")[-1]
+        user_id = callback.from_user.id
+
+        user_keys = get_user_keys(user_id)
+        active_keys = [key for key in user_keys if datetime.fromisoformat(key['expiry_date']) > datetime.now()]
+        latest_key = max(active_keys, key=lambda k: datetime.fromisoformat(k['expiry_date']))
+        expiry_timestamp_ms = int(datetime.fromisoformat(latest_key['expiry_date']).timestamp() * 1000)
+
+        try:
+            private_key = WireguardKey.generate()
+            public_key = private_key.public_key()
+        except Exception as e:
+            logger.error(f"Error generating WireGuard keys: {e}")
+            await callback.message.edit_text("❌ Ошибка при генерации ключей.")
+            await state.clear()
+            return
+
+        host = rw_repo.get_host(host_name)
+        if not host:
+            await callback.message.edit_text("❌ Ошибка: не удалось найти выбранную ноду.")
+            await state.clear()
+            return
+
+        user_data = get_user(user_id) or {}
+        raw_username = (user_data.get('username') or f'user{user_id}').lower()
+        username_slug = re.sub(r"[^a-z0-9._-]", "_", raw_username).strip("_")[:16] or f"user{user_id}"
+        base_local = f"awg_{username_slug}"
+        candidate_local = base_local
+        attempt = 1
+        while True:
+            candidate_email = f"{candidate_local}@bot.local"
+            if not rw_repo.get_key_by_email(candidate_email):
+                break
+            attempt += 1
+            candidate_local = f"{base_local}-{attempt}"
+            if attempt > 100:
+                candidate_local = f"{base_local}-{int(datetime.now().timestamp())}"
+                candidate_email = f"{candidate_local}@bot.local"
+                break
+
+        result = await remnawave_api.create_or_update_awg_user_on_host(
+            host_name=host_name,
+            email=candidate_email,
+            expiry_timestamp_ms=expiry_timestamp_ms
+        )
+
+        if not result:
+            await callback.message.edit_text("❌ Не удалось создать пользователя на ноде.")
+            await state.clear()
+            return
+
+        client_ip = result.get('ip') or result.get('address') or "10.0.0.2/32"
+        if client_ip == "10.0.0.2/32":
+            logger.warning(f"IP address for user {user_id} on host {host_name} not found in API response. Using fallback.")
+
+        config_str = generate_awg_config(
+            private_key=str(private_key),
+            address=client_ip,
+            dns="8.8.8.8",
+            mtu=1420,
+            listen_port=host.get('wireguard_port') or 51820,
+            public_key=host.get('server_public_key'),
+            endpoint=f"{host.get('ssh_host')}:{host.get('wireguard_port') or 51820}"
+        )
+
+        config_file = BufferedInputFile(config_str.encode(), filename=f"{host_name}.conf")
+
+        await callback.message.answer_document(
+            document=config_file,
+            caption=f"Ваш конфигурационный файл для {host_name}."
+        )
+
+        await state.clear()

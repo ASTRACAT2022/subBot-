@@ -66,50 +66,11 @@ def create_admin_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🌍 Ключи на хосте", callback_data="admin_host_keys")
     builder.button(text="🎟 Промокоды", callback_data="admin_promo_menu")
     builder.button(text="📊 Мониторинг", callback_data="admin_monitor")
-    builder.button(text="⚙️ Управление нодами", callback_data="admin_nodes_menu")
     builder.button(text="♻️ Восстановить БД", callback_data="admin_restore_db")
     builder.button(text="📢 Рассылка", callback_data="start_broadcast")
     builder.button(text=(get_setting("btn_back_to_menu_text") or "⬅️ Назад в меню"), callback_data="back_to_main_menu")
 
-    builder.adjust(2, 2, 2, 2, 2, 2)
-    return builder.as_markup()
-
-
-def create_admin_nodes_menu_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить ноду", callback_data="admin_add_node")
-    builder.button(text="📋 Список нод", callback_data="admin_list_nodes")
-    builder.button(text="⬅️ В админ-меню", callback_data="admin_menu")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def create_admin_nodes_list_keyboard(nodes: list[dict]) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    if nodes:
-        for node in nodes:
-            name = node.get('host_name')
-            country = node.get('country')
-            title = f"{name} ({country})" if country else name
-            builder.button(text=title, callback_data=f"noop")
-            builder.button(text="🗑 Удалить", callback_data=f"admin_delete_node_prompt_{name}")
-    else:
-        builder.button(text="Нод еще нет", callback_data="noop")
-    builder.button(text="⬅️ Назад", callback_data="admin_nodes_menu")
-
-    rows = []
-    if nodes:
-        rows.extend([2] * len(nodes))
-    rows.append(1)
-    builder.adjust(*rows)
-    return builder.as_markup()
-
-
-def create_admin_delete_node_confirm_keyboard(node_name: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить удаление", callback_data=f"admin_delete_node_confirm_{node_name}")
-    builder.button(text="❌ Отмена", callback_data="admin_list_nodes")
-    builder.adjust(1)
+    builder.adjust(2, 2, 2, 2, 2, 1)
     return builder.as_markup()
 
 def create_admins_menu_keyboard() -> InlineKeyboardMarkup:
@@ -543,7 +504,6 @@ def create_keys_management_keyboard(keys: list) -> InlineKeyboardMarkup:
             host_name = key.get('host_name', 'Неизвестный хост')
             button_text = f"{status_icon} Ключ #{i+1} ({host_name}) (до {expiry_date.strftime('%d.%m.%Y')})"
             builder.button(text=button_text, callback_data=f"show_key_{key['key_id']}")
-    builder.button(text="🚀 Сгенерировать конфиг", callback_data="generate_config")
     builder.button(text=(get_setting("btn_buy_key_text") or "🛒 Купить ключ"), callback_data="buy_new_key")
     builder.button(text=(get_setting("btn_back_to_menu_text") or "⬅️ Назад в меню"), callback_data="back_to_main_menu")
     builder.adjust(1)

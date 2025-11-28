@@ -513,10 +513,16 @@ async def create_or_update_key_on_host(
         expiry_ts_ms = int(expire_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
         return {
-            "connection_string": subscription_url,
-            "expiry_timestamp_ms": expiry_ts_ms,
-            "user_uuid": user_payload.get("uuid"),
-            "user_payload": user_payload,
+            'client_uuid': user_payload.get('uuid'),
+            'short_uuid': user_payload.get('shortUuid'),
+            'email': email,
+            'host_name': squad.get('host_name') or host_name,
+            'squad_uuid': squad_uuid,
+            'subscription_url': subscription_url,
+            'traffic_limit_bytes': user_payload.get('trafficLimitBytes'),
+            'traffic_limit_strategy': user_payload.get('trafficLimitStrategy'),
+            'expiry_timestamp_ms': expiry_ts_ms,
+            'connection_string': subscription_url,
         }
     except RemnawaveAPIError as exc:
         logger.error("Remnawave: ошибка create_or_update_key_on_host %s/%s: %s", host_name, email, exc)
@@ -580,53 +586,3 @@ async def delete_client_on_host(host_name: str, client_email: str) -> bool:
     except Exception:
         logger.exception("Remnawave: непредвиденная ошибка удаления пользователя %s", client_email)
     return False
-
-
-async def create_or_update_awg_user_on_host(
-    host_name: str,
-    email: str,
-    days_to_add: int | None = None,
-    expiry_timestamp_ms: int | None = None,
-    *,
-    description: str | None = None,
-    tag: str | None = None,
-) -> dict | None:
-    """Создаёт/обновляет пользователя Remnawave и возвращает полный payload."""
-    try:
-        squad = rw_repo.get_squad(host_name)
-        if not squad:
-            logger.error("Remnawave: не найден сквад/хост '%s'", host_name)
-            return None
-        squad_uuid = (squad.get('squad_uuid') or '').strip()
-        if not squad_uuid:
-            logger.error("Remnawave: сквад '%s' не имеет squad_uuid", host_name)
-            return None
-
-        if expiry_timestamp_ms is not None:
-            target_dt = datetime.fromtimestamp(expiry_timestamp_ms / 1000, tz=timezone.utc)
-        else:
-            days = days_to_add if days_to_add is not None else int(rw_repo.get_setting('default_extension_days') or 30)
-            if days <= 0:
-                days = 1
-            target_dt = datetime.now(timezone.utc) + timedelta(days=days)
-
-        traffic_limit_bytes = squad.get('default_traffic_limit_bytes')
-        traffic_limit_strategy = squad.get('default_traffic_strategy') or 'NO_RESET'
-
-        user_payload = await ensure_user(
-            host_name=host_name,
-            email=email,
-            squad_uuid=squad_uuid,
-            expire_at=target_dt,
-            traffic_limit_bytes=traffic_limit_bytes,
-            traffic_limit_strategy=traffic_limit_strategy,
-            description=description,
-            tag=tag,
-            username=email.split('@')[0] if email else None,
-        )
-        return user_payload
-    except RemnawaveAPIError as exc:
-        logger.error("Remnawave: ошибка create_or_update_awg_user_on_host %s/%s: %s", host_name, email, exc)
-    except Exception:
-        logger.exception("Remnawave: непредвиденная ошибка create_or_update_awg_user_on_host для %s/%s", host_name, email)
-    return None

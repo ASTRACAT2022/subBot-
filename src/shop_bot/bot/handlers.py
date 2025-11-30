@@ -1898,34 +1898,6 @@ def get_user_router() -> Router:
             logger.error(f"Error creating Happ CryptoLink for key {key_id}: {e}")
             await callback.answer("Произошла ошибка при создании ссылки.", show_alert=True)
 
-async def initiate_purchase_flow(event: types.CallbackQuery, state: FSMContext, user_id: int, **kwargs):
-    """
-    Initiates the purchase flow after a plan is selected. It triggers a CAPTCHA check if necessary
-    before proceeding to ask for the user's email.
-    """
-    message = event.message
-    host_name = kwargs.get('host_name')
-
-    # This is a safe, read-only call used to trigger the CAPTCHA check if the user is suspicious.
-    await remnawave_api.list_users(host_name=host_name, user_id=user_id, size=1)
-
-    # If the CAPTCHA is passed (or not required), proceed to the email prompt.
-    await state.update_data(
-        action=kwargs.get('action'),
-        key_id=kwargs.get('key_id'),
-        plan_id=kwargs.get('plan_id'),
-        host_name=host_name
-    )
-
-    await message.edit_text(
-        "📧 Пожалуйста, введите ваш email для отправки чека об оплате.\\n\\n"
-        "Если вы не хотите указывать почту, нажмите кнопку ниже.",
-        reply_markup=keyboards.create_skip_email_keyboard()
-    )
-    await state.set_state(PaymentProcess.waiting_for_email)
-
-ACTION_REGISTRY['initiate_purchase_flow'] = initiate_purchase_flow
-
     @user_router.callback_query(F.data.startswith("howto_vless_"))
     @registration_required
     async def show_instruction_handler(callback: types.CallbackQuery):
@@ -2169,10 +2141,6 @@ ACTION_REGISTRY['initiate_purchase_flow'] = initiate_purchase_flow
     @user_router.callback_query(F.data.startswith("buy_"))
     @registration_required
     async def plan_selection_handler(callback: types.CallbackQuery, state: FSMContext):
-        """
-        Handles the selection of a tariff plan. This is the entry point for the purchase flow.
-        It extracts the necessary details and then passes control to the CAPTCHA handler.
-        """
         await callback.answer()
         
         parts = callback.data.split("_")[1:]
@@ -2181,16 +2149,16 @@ ACTION_REGISTRY['initiate_purchase_flow'] = initiate_purchase_flow
         plan_id = int(parts[-3])
         host_name = "_".join(parts[:-3])
 
-        # Defer the business logic to a separate function that can be called after CAPTCHA.
-        await handle_action_with_captcha(
-            action_func=initiate_purchase_flow,
-            event=callback,
-            state=state,
-            action=action,
-            key_id=key_id,
-            plan_id=plan_id,
-            host_name=host_name
+        await state.update_data(
+            action=action, key_id=key_id, plan_id=plan_id, host_name=host_name
         )
+        
+        await callback.message.edit_text(
+            "📧 Пожалуйста, введите ваш email для отправки чека об оплате.\n\n"
+            "Если вы не хотите указывать почту, нажмите кнопку ниже.",
+            reply_markup=keyboards.create_skip_email_keyboard()
+        )
+        await state.set_state(PaymentProcess.waiting_for_email)
 
     @user_router.callback_query(PaymentProcess.waiting_for_email, F.data == "back_to_plans")
     async def back_to_plans_handler(callback: types.CallbackQuery, state: FSMContext):

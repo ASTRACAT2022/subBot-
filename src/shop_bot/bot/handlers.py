@@ -73,6 +73,8 @@ from shop_bot.config import (
 )
 from shop_bot.data_manager import remnawave_repository as rw_repo
 from shop_bot.modules import remnawave_api, happ_crypto
+from shop_bot.modules.remnawave_api import CaptchaRequiredError, verify_captcha_token, mark_captcha_solved, increment_captcha_attempts
+from shop_bot.modules.captcha_service import CaptchaService
 
 TELEGRAM_BOT_USERNAME = None
 PAYMENT_METHODS = None
@@ -376,6 +378,9 @@ class SupportDialog(StatesGroup):
     waiting_for_subject = State()
     waiting_for_message = State()
     waiting_for_reply = State()
+
+class CaptchaProcess(StatesGroup):
+    waiting_for_captcha = State()
 
 def is_valid_email(email: str) -> bool:
     pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
@@ -1597,310 +1602,433 @@ def get_user_router() -> Router:
             reply_markup=keyboards.create_keys_management_keyboard(user_keys)
         )
 
-    @user_router.callback_query(F.data == "get_trial")
-    @registration_required
-    async def trial_period_handler(callback: types.CallbackQuery, state: FSMContext):
-        user_id = callback.from_user.id
-        user_db_data = get_user(user_id)
-        if user_db_data and user_db_data.get('trial_used'):
-            await callback.answer("Вы уже использовали бесплатный пробный период.", show_alert=True)
+# Action registry for resuming operations after CAPTCHA
+ACTION_REGISTRY: Dict[str, callable] = {}
+
+async def run_captcha_and_resume(bot: Bot, user_id: int, chat_id: int, message_id: int, port: int, state: FSMContext):
+    """
+    Runs the CAPTCHA server, verifies the result, and resumes the original action.
+    This function is intended to be run as a background task.
+    """
+    secret_key = rw_repo.get_setting("captcha_secret_key")
+    captcha_service = CaptchaService(secret_key)
+
+    # This is a blocking call, so we run it in a thread to not block the event loop
+    token = await asyncio.to_thread(captcha_service.get_verification_token, port)
+
+    data = await state.get_data()
+    await state.clear() # Clear state early to prevent race conditions
+
+    if token and await verify_captcha_token(token):
+        mark_captcha_solved(user_id, True)
+        try:
+            await bot.edit_message_text("✅ CAPTCHA пройдена. Возобновляю операцию...", chat_id, message_id)
+        except TelegramBadRequest:
+            await bot.send_message(chat_id, "✅ CAPTCHA пройдена. Возобновляю операцию...")
+
+        action_name = data.get('captcha_action_name')
+        action_func = ACTION_REGISTRY.get(action_name)
+
+        if not action_func:
+            logger.error(f"Could not find action '{action_name}' in registry to resume after captcha.")
+            await bot.send_message(chat_id, "❌ Произошла внутренняя ошибка. Не удалось возобновить операцию. Попробуйте снова.")
             return
 
-        hosts = get_all_hosts()
-        if not hosts:
-            await callback.message.edit_text("❌ В данный момент нет доступных серверов для создания пробного ключа.")
-            return
-            
-        if len(hosts) == 1:
-            await callback.answer()
-            await process_trial_key_creation(callback.message, hosts[0]['host_name'])
+        # Reconstruct the original event that triggered the action
+        event_data = data.get('captcha_event_data')
+        event_type = data.get('captcha_event_type')
+        if event_type == 'callback_query':
+            event = types.CallbackQuery.model_validate(event_data, context={"bot": bot})
+        elif event_type == 'message':
+            event = types.Message.model_validate(event_data, context={"bot": bot})
         else:
-            await callback.answer()
-            await callback.message.edit_text(
-                "Выберите сервер, на котором хотите получить пробный ключ:",
-                reply_markup=keyboards.create_host_selection_keyboard(hosts, action="trial")
-            )
-
-    @user_router.callback_query(F.data.startswith("select_host_trial_"))
-    @registration_required
-    async def trial_host_selection_handler(callback: types.CallbackQuery):
-        await callback.answer()
-        host_name = callback.data[len("select_host_trial_"):]
-        await process_trial_key_creation(callback.message, host_name)
-
-    async def process_trial_key_creation(message: types.Message, host_name: str):
-        user_id = message.chat.id
-        await message.edit_text(f"Отлично! Создаю для вас бесплатный ключ на {get_setting('trial_duration_days')} дня на сервере \"{host_name}\"...")
+            logger.error(f"Unknown event type '{event_type}' for captcha resumption.")
+            await bot.send_message(chat_id, "❌ Произошла ошибка. Не удалось возобновить операцию.")
+            return
+            
+        action_kwargs = data.get('captcha_action_kwargs', {})
 
         try:
+            # Call the original business logic function
+            await action_func(event, state, user_id, **action_kwargs)
+        except Exception as e:
+            logger.error(f"Error resuming action '{action_name}' after captcha for user {user_id}: {e}", exc_info=True)
+            await bot.send_message(chat_id, "❌ Произошла ошибка при выполнении операции после CAPTCHA.")
 
-            user_data = get_user(user_id) or {}
-            raw_username = (user_data.get('username') or f'user{user_id}').lower()
-            username_slug = re.sub(r"[^a-z0-9._-]", "_", raw_username).strip("_")[:16] or f"user{user_id}"
-            base_local = f"trial_{username_slug}"
-            candidate_local = base_local
-            attempt = 1
-            while True:
-                candidate_email = f"{candidate_local}@bot.local"
-                if not rw_repo.get_key_by_email(candidate_email):
-                    break
-                attempt += 1
-                candidate_local = f"{base_local}-{attempt}"
-                if attempt > 100:
-                    candidate_local = f"{base_local}-{int(datetime.now().timestamp())}"
-                    candidate_email = f"{candidate_local}@bot.local"
-                    break
+    else:
+        mark_captcha_solved(user_id, False)
+        increment_captcha_attempts(user_id)
+        try:
+            await bot.edit_message_text("❌ CAPTCHA не пройдена. Попробуйте еще раз.", chat_id, message_id)
+        except TelegramBadRequest:
+             await bot.send_message(chat_id, "❌ CAPTCHA не пройдена. Попробуйте еще раз.")
 
-            result = await remnawave_api.create_or_update_key_on_host(
-                host_name=host_name,
-                email=candidate_email,
-                days_to_add=int(get_setting("trial_duration_days"))
-            )
-            if not result:
-                await message.edit_text("❌ Не удалось создать пробный ключ. Ошибка на сервере.")
-                return
 
-            set_trial_used(user_id)
-            
-            new_key_id = rw_repo.record_key_from_payload(
-                user_id=user_id,
-                payload=result,
-                host_name=host_name,
-            )
-            
+async def handle_action_with_captcha(action_func: callable, event: types.Union[types.Message, types.CallbackQuery], state: FSMContext, **action_kwargs):
+    """
+    A wrapper that executes a given action and handles the CAPTCHA verification flow if required.
+    """
+    user_id = event.from_user.id
+    bot = Bot.get_current()
+
+    try:
+        await action_func(event=event, state=state, user_id=user_id, **action_kwargs)
+    except CaptchaRequiredError as e:
+        message = event if isinstance(event, types.Message) else event.message
+
+        # We must store only serializable data in the FSM
+        if isinstance(event, types.CallbackQuery):
+            event_type = 'callback_query'
+        else:
+            event_type = 'message'
+
+        # `model_dump` creates a serializable dict from the object
+        serializable_event = event.model_dump(exclude={'bot'})
+
+        await state.update_data(
+            captcha_action_name=action_func.__name__,
+            captcha_event_type=event_type,
+            captcha_event_data=serializable_event,
+            captcha_action_kwargs=action_kwargs
+        )
+        await state.set_state(CaptchaProcess.waiting_for_captcha)
+
+        try:
             await message.delete()
-            new_expiry_date = datetime.fromtimestamp(result['expiry_timestamp_ms'] / 1000)
-            final_text = get_purchase_success_text("new", get_next_key_number(user_id) -1, new_expiry_date, result['connection_string'])
-            await message.answer(text=final_text, reply_markup=keyboards.create_key_info_keyboard(new_key_id))
+        except TelegramBadRequest:
+            pass # Ignore if message is already deleted or cannot be deleted
 
-        except Exception as e:
-            logger.error(f"Error creating trial key for user {user_id} on host {host_name}: {e}", exc_info=True)
-            await message.edit_text("❌ Произошла ошибка при создании пробного ключа.")
-
-    @user_router.callback_query(F.data.startswith("show_key_"))
-    @registration_required
-    async def show_key_handler(callback: types.CallbackQuery):
-        key_id_to_show = int(callback.data.split("_")[2])
-        await callback.message.edit_text("Загружаю информацию о ключе...")
-        user_id = callback.from_user.id
-        key_data = rw_repo.get_key_by_id(key_id_to_show)
-
-        if not key_data or key_data['user_id'] != user_id:
-            await callback.message.edit_text("❌ Ошибка: ключ не найден.")
-            return
-            
-        try:
-            details = await remnawave_api.get_key_details_from_host(key_data)
-            if not details or not details['connection_string']:
-                await callback.message.edit_text("❌ Ошибка на сервере. Не удалось получить данные ключа.")
-                return
-
-            connection_string = details['connection_string']
-            expiry_date = datetime.fromisoformat(key_data['expiry_date'])
-            created_date = datetime.fromisoformat(key_data['created_date'])
-            
-            all_user_keys = get_user_keys(user_id)
-            key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key['key_id'] == key_id_to_show), 0)
-            
-            final_text = get_key_info_text(key_number, expiry_date, created_date, connection_string)
-            
-            await callback.message.edit_text(
-                text=final_text,
-                reply_markup=keyboards.create_key_info_keyboard(key_id_to_show)
-            )
-        except Exception as e:
-            logger.error(f"Error showing key {key_id_to_show}: {e}")
-            await callback.message.edit_text("❌ Произошла ошибка при получении данных ключа.")
-
-    @user_router.callback_query(F.data.startswith("switch_server_"))
-    @registration_required
-    async def switch_server_start(callback: types.CallbackQuery):
-        await callback.answer()
-        try:
-            key_id = int(callback.data[len("switch_server_"):])
-        except ValueError:
-            await callback.answer("Некорректный идентификатор ключа.", show_alert=True)
-            return
-
-        key_data = rw_repo.get_key_by_id(key_id)
-        if not key_data or key_data.get('user_id') != callback.from_user.id:
-            await callback.answer("Ключ не найден.", show_alert=True)
-            return
-
-        hosts = get_all_hosts()
-        if not hosts:
-            await callback.answer("Нет доступных серверов.", show_alert=True)
-            return
-
-        current_host = key_data.get('host_name')
-        hosts = [h for h in hosts if h.get('host_name') != current_host]
-        if not hosts:
-            await callback.answer("Другие серверы отсутствуют.", show_alert=True)
-            return
-
-        await callback.message.edit_text(
-            "Выберите новый сервер (локацию) для этого ключа:",
-            reply_markup=keyboards.create_host_selection_keyboard(hosts, action=f"switch_{key_id}")
+        sent_message = await message.answer(
+            f"Пожалуйста, пройдите проверку CAPTCHA, чтобы продолжить. Ссылка действительна 40 секунд.",
+            reply_markup=keyboards.create_captcha_keyboard(e.url)
         )
 
-    @user_router.callback_query(F.data.startswith("select_host_switch_"))
-    @registration_required
-    async def select_host_for_switch(callback: types.CallbackQuery):
+        # Run the blocking CAPTCHA check and the subsequent logic in a background task
+        # so the bot remains responsive.
+        asyncio.create_task(run_captcha_and_resume(
+            bot, user_id, sent_message.chat.id, sent_message.message_id, e.port, state
+        ))
+
+# --- Trial Key ---
+@user_router.callback_query(F.data == "get_trial")
+@registration_required
+async def trial_period_handler(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    user_db_data = get_user(user_id)
+    if user_db_data and user_db_data.get('trial_used'):
+        await callback.answer("Вы уже использовали бесплатный пробный период.", show_alert=True)
+        return
+
+    hosts = get_all_hosts()
+    if not hosts:
+        await callback.message.edit_text("❌ В данный момент нет доступных серверов для создания пробного ключа.")
+        return
+
+    if len(hosts) == 1:
         await callback.answer()
-        payload = callback.data[len("select_host_switch_"):]
-        parts = payload.split("_", 1)
-        if len(parts) != 2:
-            await callback.answer("Некорректные данные выбора сервера.", show_alert=True)
-            return
-        try:
-            key_id = int(parts[0])
-        except ValueError:
-            await callback.answer("Некорректный идентификатор ключа.", show_alert=True)
-            return
-        new_host_name = parts[1]
-
-        key_data = rw_repo.get_key_by_id(key_id)
-
-        if not key_data or key_data.get('user_id') != callback.from_user.id:
-            await callback.answer("Ключ не найден.", show_alert=True)
-            return
-
-        old_host = key_data.get('host_name')
-        if not old_host:
-            await callback.answer("Для ключа не указан текущий сервер.", show_alert=True)
-            return
-        if new_host_name == old_host:
-            await callback.answer("Это уже текущий сервер.", show_alert=True)
-            return
-
-
-        try:
-            expiry_dt = datetime.fromisoformat(key_data['expiry_date'])
-            expiry_timestamp_ms_exact = int(expiry_dt.timestamp() * 1000)
-        except Exception:
-
-            now_dt = datetime.now()
-            expiry_timestamp_ms_exact = int((now_dt + timedelta(days=1)).timestamp() * 1000)
-
+        await handle_action_with_captcha(
+            action_func=process_trial_key_creation,
+            event=callback,
+            state=state,
+            host_name=hosts[0]['host_name']
+        )
+    else:
+        await callback.answer()
         await callback.message.edit_text(
-            f"⏳ Переношу ключ на сервер \"{new_host_name}\"..."
+            "Выберите сервер, на котором хотите получить пробный ключ:",
+            reply_markup=keyboards.create_host_selection_keyboard(hosts, action="trial")
         )
 
-        email = key_data.get('key_email')
+@user_router.callback_query(F.data.startswith("select_host_trial_"))
+@registration_required
+async def trial_host_selection_handler(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    host_name = callback.data[len("select_host_trial_"):]
+    await handle_action_with_captcha(
+        action_func=process_trial_key_creation,
+        event=callback,
+        state=state,
+        host_name=host_name
+    )
+
+async def process_trial_key_creation(event: types.CallbackQuery, state: FSMContext, user_id: int, host_name: str):
+    message = event.message
+    await message.edit_text(f"Отлично! Создаю для вас бесплатный ключ на {get_setting('trial_duration_days')} дня на сервере \"{host_name}\"...")
+
+    try:
+        user_data = get_user(user_id) or {}
+        raw_username = (user_data.get('username') or f'user{user_id}').lower()
+        username_slug = re.sub(r"[^a-z0-9._-]", "_", raw_username).strip("_")[:16] or f"user{user_id}"
+        base_local = f"trial_{username_slug}"
+        candidate_local = base_local
+        attempt = 1
+        while True:
+            candidate_email = f"{candidate_local}@bot.local"
+            if not rw_repo.get_key_by_email(candidate_email):
+                break
+            attempt += 1
+            candidate_local = f"{base_local}-{attempt}"
+            if attempt > 100:
+                candidate_local = f"{base_local}-{int(datetime.now().timestamp())}"
+                candidate_email = f"{candidate_local}@bot.local"
+                break
+
+        result = await remnawave_api.create_or_update_key_on_host(
+            host_name=host_name,
+            email=candidate_email,
+            days_to_add=int(get_setting("trial_duration_days")),
+            user_id=user_id
+        )
+        if not result:
+            await message.edit_text("❌ Не удалось создать пробный ключ. Ошибка на сервере.")
+            return
+
+        set_trial_used(user_id)
+
+        new_key_id = rw_repo.record_key_from_payload(
+            user_id=user_id,
+            payload=result,
+            host_name=host_name,
+        )
+
+        await message.delete()
+        new_expiry_date = datetime.fromtimestamp(result['expiry_timestamp_ms'] / 1000)
+        final_text = get_purchase_success_text("new", get_next_key_number(user_id) -1, new_expiry_date, result['connection_string'])
+        await message.answer(text=final_text, reply_markup=keyboards.create_key_info_keyboard(new_key_id))
+
+    except Exception as e:
+        logger.error(f"Error creating trial key for user {user_id} on host {host_name}: {e}", exc_info=True)
+        await message.edit_text("❌ Произошла ошибка при создании пробного ключа.")
+
+# --- Key Management ---
+@user_router.callback_query(F.data.startswith("show_key_"))
+@registration_required
+async def show_key_handler_entry(callback: types.CallbackQuery, state: FSMContext):
+    key_id_to_show = int(callback.data.split("_")[2])
+    await handle_action_with_captcha(
+        action_func=show_key_handler,
+        event=callback,
+        state=state,
+        key_id=key_id_to_show
+    )
+
+async def show_key_handler(event: types.CallbackQuery, state: FSMContext, user_id: int, key_id: int):
+    message = event.message
+    await message.edit_text("Загружаю информацию о ключе...")
+    key_data = rw_repo.get_key_by_id(key_id)
+
+    if not key_data or key_data['user_id'] != user_id:
+        await message.edit_text("❌ Ошибка: ключ не найден.")
+        return
+
+    try:
+        details = await remnawave_api.get_key_details_from_host(key_data, user_id=user_id)
+        if not details or not details['connection_string']:
+            await message.edit_text("❌ Ошибка на сервере. Не удалось получить данные ключа.")
+            return
+
+        connection_string = details['connection_string']
+        expiry_date = datetime.fromisoformat(key_data['expiry_date'])
+        created_date = datetime.fromisoformat(key_data['created_date'])
+
+        all_user_keys = get_user_keys(user_id)
+        key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key['key_id'] == key_id), 0)
+
+        final_text = get_key_info_text(key_number, expiry_date, created_date, connection_string)
+
+        await message.edit_text(
+            text=final_text,
+            reply_markup=keyboards.create_key_info_keyboard(key_id)
+        )
+    except Exception as e:
+        logger.error(f"Error showing key {key_id}: {e}")
+        await message.edit_text("❌ Произошла ошибка при получении данных ключа.")
+
+@user_router.callback_query(F.data.startswith("switch_server_"))
+@registration_required
+async def switch_server_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        key_id = int(callback.data[len("switch_server_"):])
+    except ValueError:
+        await callback.answer("Некорректный идентификатор ключа.", show_alert=True)
+        return
+
+    key_data = rw_repo.get_key_by_id(key_id)
+    if not key_data or key_data.get('user_id') != callback.from_user.id:
+        await callback.answer("Ключ не найден.", show_alert=True)
+        return
+
+    hosts = get_all_hosts()
+    if not hosts:
+        await callback.answer("Нет доступных серверов.", show_alert=True)
+        return
+
+    current_host = key_data.get('host_name')
+    hosts = [h for h in hosts if h.get('host_name') != current_host]
+    if not hosts:
+        await callback.answer("Другие серверы отсутствуют.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "Выберите новый сервер (локацию) для этого ключа:",
+        reply_markup=keyboards.create_host_selection_keyboard(hosts, action=f"switch_{key_id}")
+    )
+
+@user_router.callback_query(F.data.startswith("select_host_switch_"))
+@registration_required
+async def select_host_for_switch_entry(callback: types.CallbackQuery, state: FSMContext):
+    payload = callback.data[len("select_host_switch_"):]
+    parts = payload.split("_", 1)
+    if len(parts) != 2: return
+    try:
+        key_id = int(parts[0])
+    except ValueError: return
+    new_host_name = parts[1]
+
+    await handle_action_with_captcha(
+        action_func=select_host_for_switch,
+        event=callback,
+        state=state,
+        key_id=key_id,
+        new_host_name=new_host_name
+    )
+
+async def select_host_for_switch(event: types.CallbackQuery, state: FSMContext, user_id: int, key_id: int, new_host_name: str):
+    await event.answer()
+    message = event.message
+    key_data = rw_repo.get_key_by_id(key_id)
+
+    if not key_data or key_data.get('user_id') != user_id:
+        await message.edit_text("❌ Ключ не найден.")
+        return
+
+    old_host = key_data.get('host_name')
+    if not old_host:
+        await message.edit_text("❌ Для ключа не указан текущий сервер.")
+        return
+    if new_host_name == old_host:
+        await message.edit_text("Это уже текущий сервер.")
+        return
+
+    try:
+        expiry_dt = datetime.fromisoformat(key_data['expiry_date'])
+        expiry_timestamp_ms_exact = int(expiry_dt.timestamp() * 1000)
+    except Exception:
+        now_dt = datetime.now()
+        expiry_timestamp_ms_exact = int((now_dt + timedelta(days=1)).timestamp() * 1000)
+
+    await message.edit_text(f"⏳ Переношу ключ на сервер \"{new_host_name}\"...")
+
+    email = key_data.get('key_email')
+    try:
+        result = await remnawave_api.create_or_update_key_on_host(
+            host_name=new_host_name, email=email, days_to_add=None,
+            expiry_timestamp_ms=expiry_timestamp_ms_exact, user_id=user_id
+        )
+        if not result:
+            await message.edit_text(f"❌ Не удалось перенести ключ на \"{new_host_name}\".")
+            return
+
         try:
-
-            result = await remnawave_api.create_or_update_key_on_host(
-                new_host_name,
-                email,
-                days_to_add=None,
-                expiry_timestamp_ms=expiry_timestamp_ms_exact
-            )
-            if not result:
-                await callback.message.edit_text(
-                    f"❌ Не удалось перенести ключ на сервер \"{new_host_name}\". Попробуйте позже."
-                )
-                return
-
-
-            try:
-                await remnawave_api.delete_client_on_host(old_host, email)
-            except Exception:
-                pass
-
-
-            update_key_host_and_info(
-                key_id=key_id,
-                new_host_name=new_host_name,
-                new_remnawave_uuid=result['client_uuid'],
-                new_expiry_ms=result['expiry_timestamp_ms']
-            )
-
-
-            try:
-                updated_key = rw_repo.get_key_by_id(key_id)
-                details = await remnawave_api.get_key_details_from_host(updated_key)
-                if details and details.get('connection_string'):
-                    connection_string = details['connection_string']
-                    expiry_date = datetime.fromisoformat(updated_key['expiry_date'])
-                    created_date = datetime.fromisoformat(updated_key['created_date'])
-                    all_user_keys = get_user_keys(callback.from_user.id)
-                    key_number = next((i + 1 for i, k in enumerate(all_user_keys) if k['key_id'] == key_id), 0)
-                    final_text = get_key_info_text(key_number, expiry_date, created_date, connection_string)
-                    await callback.message.edit_text(
-                        text=final_text,
-                        reply_markup=keyboards.create_key_info_keyboard(key_id)
-                    )
-                else:
-
-                    await callback.message.edit_text(
-                        f"✅ Готово! Ключ перенесён на сервер \"{new_host_name}\".\n"
-                        "Обновите подписку/конфиг в клиенте, если требуется.",
-                        reply_markup=keyboards.create_back_to_menu_keyboard()
-                    )
-            except Exception:
-                await callback.message.edit_text(
-                    f"✅ Готово! Ключ перенесён на сервер \"{new_host_name}\".\n"
-                    "Обновите подписку/конфиг в клиенте, если требуется.",
-                    reply_markup=keyboards.create_back_to_menu_keyboard()
-                )
+            await remnawave_api.delete_client_on_host(old_host, email, user_id=user_id)
         except Exception as e:
-            logger.error(f"Error switching key {key_id} to host {new_host_name}: {e}", exc_info=True)
-            await callback.message.edit_text(
-                "❌ Произошла ошибка при переносе ключа. Попробуйте позже."
-            )
+            logger.warning(f"Не удалось удалить старый ключ при переносе: {e}")
 
-    @user_router.callback_query(F.data.startswith("show_qr_"))
-    @registration_required
-    async def show_qr_handler(callback: types.CallbackQuery):
-        await callback.answer("Генерирую QR-код...")
-        key_id = int(callback.data.split("_")[2])
-        key_data = rw_repo.get_key_by_id(key_id)
-        if not key_data or key_data['user_id'] != callback.from_user.id: return
+        rw_repo.update_key_host_and_info(
+            key_id=key_id, new_host_name=new_host_name,
+            new_remnawave_uuid=result['client_uuid'], new_expiry_ms=result['expiry_timestamp_ms']
+        )
         
-        try:
-            details = await remnawave_api.get_key_details_from_host(key_data)
-            if not details or not details['connection_string']:
-                await callback.answer("Ошибка: Не удалось сгенерировать QR-код.", show_alert=True)
-                return
+        # For a better UX, we show the updated key info directly.
+        # This re-uses the logic from show_key_handler without duplicating code.
+        # We need to create a "mock" event for it, since we're not in that handler's context.
+        mock_callback_data = event.model_dump(exclude={'bot'})
+        mock_callback_data['data'] = f"show_key_{key_id}"
+        mock_event = types.CallbackQuery.model_validate(mock_callback_data, context={"bot": Bot.get_current()})
+        await show_key_handler(mock_event, state, user_id, key_id)
 
-            connection_string = details['connection_string']
-            qr_img = qrcode.make(connection_string)
-            bio = BytesIO(); qr_img.save(bio, "PNG"); bio.seek(0)
-            qr_code_file = BufferedInputFile(bio.read(), filename="vpn_qr.png")
-            await callback.message.answer_photo(photo=qr_code_file)
-        except Exception as e:
-            logger.error(f"Error showing QR for key {key_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error switching key {key_id} to host {new_host_name}: {e}", exc_info=True)
+        await message.edit_text("❌ Произошла ошибка при переносе ключа.")
 
-    @user_router.callback_query(F.data.startswith("get_happ_crypto_link_"))
-    @registration_required
-    async def get_happ_crypto_link_handler(callback: types.CallbackQuery):
-        await callback.answer("Генерирую Happ CryptoLink...")
-        key_id = int(callback.data.split("_")[4])
-        key_data = rw_repo.get_key_by_id(key_id)
-        if not key_data or key_data['user_id'] != callback.from_user.id:
-            await callback.answer("Ошибка: Не удалось найти ключ.", show_alert=True)
+@user_router.callback_query(F.data.startswith("show_qr_"))
+@registration_required
+async def show_qr_handler_entry(callback: types.CallbackQuery, state: FSMContext):
+    key_id = int(callback.data.split("_")[2])
+    await handle_action_with_captcha(
+        action_func=show_qr_handler,
+        event=callback,
+        state=state,
+        key_id=key_id
+    )
+
+async def show_qr_handler(event: types.CallbackQuery, state: FSMContext, user_id: int, key_id: int):
+    await event.answer("Генерирую QR-код...")
+    message = event.message
+    key_data = rw_repo.get_key_by_id(key_id)
+    if not key_data or key_data['user_id'] != user_id: return
+
+    try:
+        details = await remnawave_api.get_key_details_from_host(key_data, user_id=user_id)
+        if not details or not details['connection_string']:
+            await event.answer("Ошибка: Не удалось сгенерировать QR-код.", show_alert=True)
             return
 
-        try:
-            details = await remnawave_api.get_key_details_from_host(key_data)
-            if not details or not details['connection_string']:
-                await callback.answer("Ошибка: Не удалось получить данные ключа.", show_alert=True)
-                return
+        connection_string = details['connection_string']
+        qr_img = qrcode.make(connection_string)
+        bio = BytesIO(); qr_img.save(bio, "PNG"); bio.seek(0)
+        qr_code_file = BufferedInputFile(bio.read(), filename="vpn_qr.png")
+        await message.answer_photo(photo=qr_code_file)
+    except Exception as e:
+        logger.error(f"Error showing QR for key {key_id}: {e}")
 
-            connection_string = details['connection_string']
-            encrypted_link = happ_crypto.encrypt_link_with_api(connection_string)
+@user_router.callback_query(F.data.startswith("get_happ_crypto_link_"))
+@registration_required
+async def get_happ_crypto_link_handler_entry(callback: types.CallbackQuery, state: FSMContext):
+    key_id = int(callback.data.split("_")[4])
+    await handle_action_with_captcha(
+        action_func=get_happ_crypto_link_handler,
+        event=callback,
+        state=state,
+        key_id=key_id
+    )
 
-            if encrypted_link:
-                await callback.message.answer(f"Ваш Happ CryptoLink:\n<code>{encrypted_link}</code>")
-            else:
-                await callback.answer("Ошибка: Не удалось сгенерировать CryptoLink.", show_alert=True)
-        except Exception as e:
-            logger.error(f"Error creating Happ CryptoLink for key {key_id}: {e}")
-            await callback.answer("Произошла ошибка при создании ссылки.", show_alert=True)
+async def get_happ_crypto_link_handler(event: types.CallbackQuery, state: FSMContext, user_id: int, key_id: int):
+    await event.answer("Генерирую Happ CryptoLink...")
+    message = event.message
+    key_data = rw_repo.get_key_by_id(key_id)
+    if not key_data or key_data['user_id'] != user_id:
+        await event.answer("Ошибка: Не удалось найти ключ.", show_alert=True)
+        return
 
-    @user_router.callback_query(F.data.startswith("howto_vless_"))
-    @registration_required
-    async def show_instruction_handler(callback: types.CallbackQuery):
+    try:
+        details = await remnawave_api.get_key_details_from_host(key_data, user_id=user_id)
+        if not details or not details['connection_string']:
+            await event.answer("Ошибка: Не удалось получить данные ключа.", show_alert=True)
+            return
+
+        connection_string = details['connection_string']
+        encrypted_link = happ_crypto.encrypt_link_with_api(connection_string)
+
+        if encrypted_link:
+            await message.answer(f"Ваш Happ CryptoLink:\n<code>{encrypted_link}</code>")
+        else:
+            await event.answer("Ошибка: Не удалось сгенерировать CryptoLink.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error creating Happ CryptoLink for key {key_id}: {e}")
+        await event.answer("Произошла ошибка при создании ссылки.", show_alert=True)
+
+# Register actions that can be resumed after CAPTCHA
+ACTION_REGISTRY['process_trial_key_creation'] = process_trial_key_creation
+ACTION_REGISTRY['show_key_handler'] = show_key_handler
+ACTION_REGISTRY['select_host_for_switch'] = select_host_for_switch
+ACTION_REGISTRY['show_qr_handler'] = show_qr_handler
+ACTION_REGISTRY['get_happ_crypto_link_handler'] = get_happ_crypto_link_handler
+
+@user_router.callback_query(F.data.startswith("howto_vless_"))
+@registration_required
+async def show_instruction_handler(callback: types.CallbackQuery):
         await callback.answer()
         key_id = int(callback.data.split("_")[2])
 
@@ -3081,7 +3209,8 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         result = await remnawave_api.create_or_update_key_on_host(
             host_name=host_name,
             email=candidate_email,
-            days_to_add=int(months * 30)
+            days_to_add=int(months * 30),
+            user_id=user_id
         )
         if not result:
             await processing_message.edit_text("❌ Не удалось создать/обновить ключ на панели Remnawave.")

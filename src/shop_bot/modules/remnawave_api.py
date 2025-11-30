@@ -5,8 +5,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from urllib.parse import quote
 import re
-import random
-import requests
 
 import httpx
 
@@ -22,116 +20,6 @@ except Exception:
 
 class RemnawaveAPIError(RuntimeError):
     """Base error for Remnawave API interactions."""
-
-
-class CaptchaRequiredError(RemnawaveAPIError):
-    """Custom exception to indicate that a CAPTCHA is required."""
-    def __init__(self, message, url, port):
-        super().__init__(message)
-        self.url = url
-        self.port = port
-
-
-# --- CAPTCHA STATE MANAGEMENT ---
-# This is a simple in-memory state. In a multi-worker setup, a shared store like Redis would be needed.
-_captcha_context = {}
-
-def get_captcha_context(user_id):
-    """Gets or creates a CAPTCHA context for a user."""
-    if user_id not in _captcha_context:
-        _captcha_context[user_id] = {
-            'solved': False,
-            'attempts': 0
-        }
-    return _captcha_context[user_id]
-
-def mark_captcha_solved(user_id, solved=True):
-    """Marks the CAPTCHA as solved for the user's session."""
-    ctx = get_captcha_context(user_id)
-    ctx['solved'] = solved
-    if not solved:
-        ctx['attempts'] = 0 # Reset attempts if we are resetting the solved state
-
-def captcha_is_solved(user_id):
-    """Checks if the CAPTCHA has been solved in the current session."""
-    if not user_id:
-        return True # Don't captcha system events
-    return get_captcha_context(user_id)['solved']
-
-def increment_captcha_attempts(user_id):
-    """Increments the CAPTCHA attempt counter."""
-    ctx = get_captcha_context(user_id)
-    ctx['attempts'] += 1
-    return ctx['attempts']
-
-MAX_CAPTCHA_ATTEMPTS = 3
-
-async def _trigger_captcha_if_needed(user_id: int | None):
-    """
-    Checks if a CAPTCHA is required for the user. If so, raises CaptchaRequiredError.
-    """
-    if not user_id or captcha_is_solved(user_id):
-        return
-
-    attempts = get_captcha_context(user_id)['attempts']
-    if attempts >= MAX_CAPTCHA_ATTEMPTS:
-        raise RemnawaveAPIError("Too many CAPTCHA attempts. Please try again later.")
-
-    port = random.randint(40000, 50000)
-
-    try:
-        domain = (rw_repo.get_setting("domain") or "127.0.0.1").strip()
-    except Exception:
-        domain = "127.0.0.1"
-
-    if "127.0.0.1" in domain or "localhost" in domain:
-        if not domain.startswith("http"):
-            domain = f"http://{domain}"
-    else:
-        if not domain.startswith("http"):
-            domain = f"https://{domain}"
-
-    captcha_url = f"{domain.rstrip('/')}:{port}/captcha"
-
-    logger.info(f"User {user_id} requires CAPTCHA verification. URL: {captcha_url}")
-
-    raise CaptchaRequiredError(
-        message="CAPTCHA verification is required to proceed.",
-        url=captcha_url,
-        port=port
-    )
-
-async def verify_captcha_token(token: str) -> bool:
-    """Verifies the CAPTCHA token with the AstraCAPTCHA API."""
-    secret_key = rw_repo.get_setting("captcha_secret_key")
-    if not secret_key:
-        logger.error("CAPTCHA_SECRET_KEY is not configured in the settings.")
-        return False
-
-    captcha_verify_url = 'https://astracaph.vercel.app/public/api/v1/verify'
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                captcha_verify_url,
-                json={'token': token, 'secretKey': secret_key}
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        if data.get('success'):
-            logger.info("CAPTCHA token verification successful.")
-            return True
-        else:
-            error_codes = data.get('error-codes', [])
-            logger.warning(f"CAPTCHA token verification failed. Response: {data}, Errors: {error_codes}")
-            return False
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error occurred during CAPTCHA verification: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during CAPTCHA verification: {e}")
-        return False
 
 
 def _normalize_email_for_remnawave(email: str) -> str:
@@ -242,9 +130,8 @@ async def _request(
     json_payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     expected_status: tuple[int, ...] = (200,),
-    user_id: int | None = None,
 ) -> httpx.Response:
-    await _trigger_captcha_if_needed(user_id)
+
     config = _load_config()
     url = f"{config['base_url']}{path}"
     headers = _build_headers(config)
@@ -291,9 +178,7 @@ async def _request_for_host(
     json_payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     expected_status: tuple[int, ...] = (200,),
-    user_id: int | None = None,
 ) -> httpx.Response:
-    await _trigger_captcha_if_needed(user_id)
     config = _load_config_for_host(host_name)
     url = f"{config['base_url']}{path}"
     headers = _build_headers(config)
@@ -339,14 +224,14 @@ def _to_iso(dt: datetime) -> str:
     return dt_utc.isoformat().replace("+00:00", "Z")
 
 
-async def get_user_by_email(email: str, *, host_name: str | None = None, user_id: int | None = None) -> dict[str, Any] | None:
+async def get_user_by_email(email: str, *, host_name: str | None = None) -> dict[str, Any] | None:
     if not email:
         return None
     encoded_email = quote(email.strip())
     if host_name:
-        response = await _request_for_host(host_name, "GET", f"/api/users/by-email/{encoded_email}", expected_status=(200, 404), user_id=user_id)
+        response = await _request_for_host(host_name, "GET", f"/api/users/by-email/{encoded_email}", expected_status=(200, 404))
     else:
-        response = await _request("GET", f"/api/users/by-email/{encoded_email}", expected_status=(200, 404), user_id=user_id)
+        response = await _request("GET", f"/api/users/by-email/{encoded_email}", expected_status=(200, 404))
     if response.status_code == 404:
         return None
     payload = response.json()
@@ -367,14 +252,14 @@ async def get_user_by_email(email: str, *, host_name: str | None = None, user_id
     return data if isinstance(data, dict) else None
 
 
-async def get_user_by_uuid(user_uuid: str, *, host_name: str | None = None, user_id: int | None = None) -> dict[str, Any] | None:
+async def get_user_by_uuid(user_uuid: str, *, host_name: str | None = None) -> dict[str, Any] | None:
     if not user_uuid:
         return None
     encoded_uuid = quote(user_uuid.strip())
     if host_name:
-        response = await _request_for_host(host_name, "GET", f"/api/users/{encoded_uuid}", expected_status=(200, 404), user_id=user_id)
+        response = await _request_for_host(host_name, "GET", f"/api/users/{encoded_uuid}", expected_status=(200, 404))
     else:
-        response = await _request("GET", f"/api/users/{encoded_uuid}", expected_status=(200, 404), user_id=user_id)
+        response = await _request("GET", f"/api/users/{encoded_uuid}", expected_status=(200, 404))
     if response.status_code == 404:
         return None
     payload = response.json()
@@ -392,7 +277,6 @@ async def ensure_user(
     description: str | None = None,
     tag: str | None = None,
     username: str | None = None,
-    user_id: int | None = None,
 ) -> dict[str, Any]:
     if not email:
         raise RemnawaveAPIError("email is required for ensure_user")
@@ -401,7 +285,7 @@ async def ensure_user(
 
 
     email = _normalize_email_for_remnawave(email)
-    current = await get_user_by_email(email, host_name=host_name, user_id=user_id)
+    current = await get_user_by_email(email, host_name=host_name)
     expire_iso = _to_iso(expire_at)
     traffic_limit_strategy = traffic_limit_strategy or "NO_RESET"
 
@@ -473,7 +357,7 @@ async def ensure_user(
         method = "POST"
         path = "/api/users"
 
-    response = await _request_for_host(host_name, method, path, json_payload=payload, expected_status=(200, 201), user_id=user_id)
+    response = await _request_for_host(host_name, method, path, json_payload=payload, expected_status=(200, 201))
     data = response.json() or {}
     result = data.get("response") if isinstance(data, dict) else None
     if not result:
@@ -493,13 +377,13 @@ async def ensure_user(
 
 
 
-async def list_users(host_name: str, squad_uuid: str | None = None, size: int | None = 500, user_id: int | None = None) -> list[dict[str, Any]]:
+async def list_users(host_name: str, squad_uuid: str | None = None, size: int | None = 500) -> list[dict[str, Any]]:
     params: dict[str, Any] = {}
     if size is not None:
         params["size"] = size
     if squad_uuid:
         params["squadUuid"] = squad_uuid
-    response = await _request_for_host(host_name, "GET", "/api/users", params=params, expected_status=(200,), user_id=user_id)
+    response = await _request_for_host(host_name, "GET", "/api/users", params=params, expected_status=(200,))
     payload = response.json() or {}
     raw_users = []
     if isinstance(payload, dict):
@@ -524,14 +408,14 @@ async def list_users(host_name: str, squad_uuid: str | None = None, size: int | 
                 filtered.append(user)
         return filtered
     return raw_users
-async def delete_user(user_uuid: str, user_id: int | None = None) -> bool:
+async def delete_user(user_uuid: str) -> bool:
     """Глобальный вариант (устарел): удаление без привязки к хосту.
     Сохраняется для обратной совместимости, но предпочтительно использовать host-specific путь ниже.
     """
     if not user_uuid:
         return False
     encoded_uuid = quote(user_uuid.strip())
-    response = await _request("DELETE", f"/api/users/{encoded_uuid}", expected_status=(200, 204, 404), user_id=user_id)
+    response = await _request("DELETE", f"/api/users/{encoded_uuid}", expected_status=(200, 204, 404))
     if response.status_code == 404:
         logger.info("Remnawave: пользователь %s не найден при удалении (возможно, уже удалён)", user_uuid)
     elif response.status_code in (200, 204):
@@ -539,12 +423,12 @@ async def delete_user(user_uuid: str, user_id: int | None = None) -> bool:
     return True
 
 
-async def delete_user_on_host(host_name: str, user_uuid: str, user_id: int | None = None) -> bool:
+async def delete_user_on_host(host_name: str, user_uuid: str) -> bool:
     """Удаление пользователя на конкретном хосте, используя конфиг хоста."""
     if not user_uuid:
         return False
     encoded_uuid = quote(user_uuid.strip())
-    response = await _request_for_host(host_name, "DELETE", f"/api/users/{encoded_uuid}", expected_status=(200, 204, 404), user_id=user_id)
+    response = await _request_for_host(host_name, "DELETE", f"/api/users/{encoded_uuid}", expected_status=(200, 204, 404))
     if response.status_code == 404:
         logger.info("Remnawave[%s]: пользователь %s не найден при удалении (возможно, уже удалён)", host_name, user_uuid)
     elif response.status_code in (200, 204):
@@ -552,20 +436,20 @@ async def delete_user_on_host(host_name: str, user_uuid: str, user_id: int | Non
     return True
 
 
-async def reset_user_traffic(user_uuid: str, user_id: int | None = None) -> bool:
+async def reset_user_traffic(user_uuid: str) -> bool:
     if not user_uuid:
         return False
     encoded_uuid = quote(user_uuid.strip())
-    await _request("POST", f"/api/users/{encoded_uuid}/actions/reset-traffic", expected_status=(200, 204), user_id=user_id)
+    await _request("POST", f"/api/users/{encoded_uuid}/actions/reset-traffic", expected_status=(200, 204))
     return True
 
 
-async def set_user_status(user_uuid: str, active: bool, user_id: int | None = None) -> bool:
+async def set_user_status(user_uuid: str, active: bool) -> bool:
     if not user_uuid:
         return False
     encoded_uuid = quote(user_uuid.strip())
     action = "enable" if active else "disable"
-    await _request("POST", f"/api/users/{encoded_uuid}/actions/{action}", expected_status=(200, 204), user_id=user_id)
+    await _request("POST", f"/api/users/{encoded_uuid}/actions/{action}", expected_status=(200, 204))
     return True
 
 
@@ -585,7 +469,6 @@ async def create_or_update_key_on_host(
     *,
     description: str | None = None,
     tag: str | None = None,
-    user_id: int | None = None,
 ) -> dict | None:
     """Legacy совместимость: создаёт/обновляет пользователя Remnawave и возвращает данные по ключу."""
     try:
@@ -619,7 +502,6 @@ async def create_or_update_key_on_host(
             description=description,
             tag=tag,
             username=email.split('@')[0] if email else None,
-            user_id=user_id,
         )
 
         subscription_url = extract_subscription_url(user_payload) or ''
@@ -649,7 +531,7 @@ async def create_or_update_key_on_host(
     return None
 
 
-async def get_key_details_from_host(key_data: dict, user_id: int | None = None) -> dict | None:
+async def get_key_details_from_host(key_data: dict) -> dict | None:
     email = key_data.get('key_email') or key_data.get('email')
     user_uuid = key_data.get('remnawave_user_uuid') or key_data.get('xui_client_uuid')
     try:
@@ -662,9 +544,9 @@ async def get_key_details_from_host(key_data: dict, user_id: int | None = None) 
                 squad = rw_repo.get_squad(sq)
                 host_name = squad.get('host_name') if squad else None
         if email:
-            user_payload = await get_user_by_email(email, host_name=host_name, user_id=user_id)
+            user_payload = await get_user_by_email(email, host_name=host_name)
         if not user_payload and user_uuid:
-            user_payload = await get_user_by_uuid(user_uuid, host_name=host_name, user_id=user_id)
+            user_payload = await get_user_by_uuid(user_uuid, host_name=host_name)
         if not user_payload:
             logger.warning("Remnawave: не найден пользователь для ключа %s", key_data.get('key_id'))
             return None
@@ -681,10 +563,10 @@ async def get_key_details_from_host(key_data: dict, user_id: int | None = None) 
     return None
 
 
-async def delete_client_on_host(host_name: str, client_email: str, user_id: int | None = None) -> bool:
+async def delete_client_on_host(host_name: str, client_email: str) -> bool:
     try:
 
-        user_payload = await get_user_by_email(client_email, host_name=host_name, user_id=user_id)
+        user_payload = await get_user_by_email(client_email, host_name=host_name)
         if not user_payload:
             logger.info("Remnawave: пользователь %s уже отсутствует", client_email)
             return True
@@ -696,7 +578,7 @@ async def delete_client_on_host(host_name: str, client_email: str, user_id: int 
             logger.warning("Remnawave: нет uuid для пользователя %s", client_email)
             return False
         logger.info("Remnawave: удаляю пользователя %s (%s) на '%s'...", client_email, user_uuid, host_name)
-        await delete_user_on_host(host_name, user_uuid, user_id=user_id)
+        await delete_user_on_host(host_name, user_uuid)
         logger.info("Remnawave: пользователь %s (%s) успешно удалён на '%s'", client_email, user_uuid, host_name)
         return True
     except RemnawaveAPIError as exc:

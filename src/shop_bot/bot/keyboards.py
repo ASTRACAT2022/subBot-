@@ -824,8 +824,3 @@ def create_dynamic_profile_keyboard() -> InlineKeyboardMarkup:
 def create_dynamic_support_menu_keyboard() -> InlineKeyboardMarkup:
     """Create support menu keyboard using dynamic configuration"""
     return create_dynamic_keyboard("support_menu")
-
-def create_captcha_keyboard(url: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Пройти проверку", url=url)
-    return builder.as_markup()
